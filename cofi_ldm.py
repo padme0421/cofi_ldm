@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.adam import Adam
 import logging
+from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO)
 
 def sample_top_p(probs, p):
     # source: llama3/generation
@@ -111,10 +114,11 @@ class CoFi_LDM_Trainer:
         inputs:
             - "prompt": str
             - "response": str
-            - "response_embeddings": List[Tensor] of shape [block_size, embed_dim]
+            - "response_embeddings": list of shape [num_blocks, block_size, embed_dim]
         """
         print("training step")
-        print(inputs["response_embeddings"][0])
+        response_embeddings = torch.tensor(inputs["response_embeddings"], dtype=torch.float)
+        print(response_embeddings.size())
         
         tokenizer = self.tokenizer
         model = self.model
@@ -122,15 +126,21 @@ class CoFi_LDM_Trainer:
         # Tokenize prompt and response
         prompt_ids = tokenizer(inputs["prompt"], return_tensors='pt').input_ids.to(model.device)  # [1, prompt_len]
         gold_response_ids = tokenizer(inputs["response"], return_tensors='pt').input_ids.to(model.device).squeeze(0)  # [response_len]
-
+       
         # Prepare response blocks
-        response_embeddings = torch.stack(inputs["response_embeddings"], dim=0).to(model.device)  # [num_blocks, block_size, dim]
         num_blocks, block_size, embed_dim = response_embeddings.shape
-
+        
+        gold_response_ids_padded = torch.zeros(num_blocks * block_size, dtype=torch.int32)
+        if gold_response_ids.shape[0] > (num_blocks * block_size):
+            gold_response_ids_padded = gold_response_ids[:num_blocks * block_size]
+        else:
+            gold_response_ids_padded[:gold_response_ids.shape[0]] = gold_response_ids
+        gold_response_ids = gold_response_ids_padded
         # Prepare prompt embeddings (shared across blocks)
         prompt_embeds = model.get_input_embeddings()(prompt_ids)  # [1, prompt_len, dim]
         prompt_embeds = prompt_embeds.expand(num_blocks, -1, -1)  # [num_blocks, prompt_len, dim]
-
+        assert prompt_embeds.dtype == torch.float
+        
         # Slice response tokens into blocks
         gold_blocks = gold_response_ids[:num_blocks * block_size].reshape(num_blocks, block_size)  # [num_blocks, block_size]
 
@@ -140,6 +150,7 @@ class CoFi_LDM_Trainer:
 
         # Embeddings for AR input tokens
         ar_embeds = model.get_input_embeddings()(ar_input_ids)  # [num_blocks, block_size - 1, dim]
+        assert ar_embeds.dtype == torch.float
 
         # Concatenate context: [prompt | response_embedding | gold_block_input]
         full_input_embeds = torch.cat([prompt_embeds, response_embeddings, ar_embeds], dim=1)  # [num_blocks, *, dim]
@@ -179,30 +190,22 @@ class CoFi_LDM_Trainer:
         combined_items = []
         
         for text_item, embed_item in zip(self.dataset, self.embed_dataset):
-            print("should be list of list")
-            print(embed_item["block_embedding"][0])
-            print("should be list")
-            print(type(embed_item["block_embedding"][0][0]))
-            print("should be number")
-            print(type(embed_item["block_embedding"][0][0][0]))
-            
             combined_item = {
                 "prompt": text_item["prompt"], 
                 "response": text_item["messages"][1]["content"], 
-                "response_embeddings": [torch.tensor(t) for t in embed_item["block_embedding"]]
+                "response_embeddings": embed_item["block_embedding"]
             }
             combined_items.append(combined_item)
             
         combined_dataset = Dataset.from_list(combined_items)
         
         dataloader = DataLoader(combined_dataset)
-        for i, item in enumerate(dataloader): # TODO: support batching
+        for i, item in tqdm(enumerate(dataloader)): # TODO: support batching
             loss = self.training_step(item)
             logging.info(loss)
             loss.backward()
             optimizer.step()
             
-    
     def eval():
         pass
         
