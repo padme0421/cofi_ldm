@@ -14,6 +14,7 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from tqdm import tqdm
+from typing import List
 
 from transformers import AutoTokenizer, AutoModel
 from generate import generate
@@ -243,7 +244,7 @@ class LLaDAEvalHarness(LM):
     def loglikelihood_rolling(self, requests):
         raise NotImplementedError
 
-    def generate_until(self, requests: list[Instance]):
+    def generate_until(self, requests: List[Instance]):
         def _tokenize(e):
             return {
                 "question": self.tokenizer(e["question"])["input_ids"],
