@@ -1,16 +1,10 @@
 from transformers import AutoTokenizer, LlamaForCausalLM
-from datasets import load_dataset, load_from_disk
-from trl import SFTConfig, SFTTrainer
-from datasets import Dataset
-import torch
-from typing import List
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import logging
+from datasets import load_dataset, load_from_disk, Dataset
 from tqdm import tqdm
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
-from transformers import BitsAndBytesConfig
-import deepspeed
+import torch
+import logging
+from peft import LoraConfig, get_peft_model, TaskType
+from torch.utils.data import DataLoader
 import os
 import huggingface_hub
 from dotenv import load_dotenv
@@ -33,20 +27,11 @@ def sample_top_p(probs, p):
 class CoFi_LDM_Trainer:
     def __init__(self, model_id: str, dataset: Dataset, embed_dataset: Dataset, 
                  test_dataset: Dataset, test_embed_dataset: Dataset):
-        
-        self.device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
-    
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
-        )
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = LlamaForCausalLM.from_pretrained(
             model_id,
-            #quantization_config=bnb_config,
-            #device_map={"": self.device},
             device_map="auto",
             torch_dtype=torch.bfloat16,
             use_cache=False
@@ -60,8 +45,6 @@ class CoFi_LDM_Trainer:
         self.embed_dataset = embed_dataset
         self.test_dataset = test_dataset
         self.test_embed_dataset = test_embed_dataset
-
-        #self.model = prepare_model_for_kbit_training(self.model)
 
         lora_config = LoraConfig(
             r=4,
@@ -81,17 +64,17 @@ class CoFi_LDM_Trainer:
         tokenizer = self.tokenizer
         model = self.model
 
-        response_embeddings = torch.tensor(response_embeddings)
+        response_embeddings = torch.tensor(response_embeddings, device=self.device, dtype=torch.bfloat16)
 
         prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
         num_blocks, block_size, _ = response_embeddings.shape
 
         prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
-        
+
         generated = torch.full((num_blocks, 1), tokenizer.bos_token_id, device=self.device)
         past_key_values = None
 
-        for i in range(block_size):
+        for _ in range(block_size):
             next_input_ids = generated[:, -1:]
             generated_embeds = model.get_input_embeddings()(next_input_ids)
 
@@ -123,9 +106,8 @@ class CoFi_LDM_Trainer:
         model = self.model
 
         response_embeddings = torch.tensor(inputs["response_embeddings"], dtype=torch.bfloat16, device=self.device)
-
-        prompt_ids = tokenizer(inputs["prompt"], return_tensors='pt').input_ids.to(self.device)
-        gold_response_ids = tokenizer(inputs["response"], return_tensors='pt').input_ids.squeeze(0).to(self.device)
+        prompt_ids = tokenizer(f"prompt: {inputs['prompt']}", return_tensors='pt', padding=True).input_ids.to(self.device)
+        gold_response_ids = tokenizer(f"response: {inputs['response']}", return_tensors='pt').input_ids.squeeze(0).to(self.device)
 
         num_blocks, block_size, _ = response_embeddings.shape
 
@@ -142,6 +124,11 @@ class CoFi_LDM_Trainer:
         ar_labels = gold_blocks[:, 1:]
 
         ar_embeds = embedding_module(ar_input_ids)
+        
+        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
+        response_tokens_embeds = embedding_module(response_tokens) # [tokens_len, dim]
+        response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
+        
         full_input_embeds = torch.cat([prompt_embeds, response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
 
         context_len = prompt_embeds.size(1) + block_size
@@ -159,36 +146,37 @@ class CoFi_LDM_Trainer:
         return output.loss
 
     def train(self):
+        torch.manual_seed(42)
+        self.model.train()
+
         combined_items = []
         for text_item, embed_item in zip(self.dataset, self.embed_dataset):
-            combined_item = {
+            combined_items.append({
                 "prompt": text_item["prompt"],
                 "response": text_item["messages"][1]["content"],
                 "response_embeddings": embed_item["block_embedding"]
-            }
-            combined_items.append(combined_item)
+            })
 
         combined_dataset = Dataset.from_list(combined_items)
-        dataloader = DataLoader(combined_dataset)
+        dataloader = DataLoader(combined_dataset, batch_size=1)
 
-        model_engine, optimizer, _, _ = deepspeed.initialize(
-            model=self.model,
-            model_parameters=self.model.parameters(),
-            config="ds_config.json"
-        )
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-5)
+        scaler = torch.cuda.amp.GradScaler()
 
-        model_engine.train()
+        for i, item in tqdm(enumerate(dataloader), total=len(dataloader)):
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                loss = self.training_step(item)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-        for i, item in tqdm(enumerate(dataloader)):
-            loss = self.training_step(item)
-            logging.info(f"loss: {loss}")
-            model_engine.backward(loss)
-            model_engine.step()
+            logging.info(f"step={i}, loss={loss.item():.4f}")
 
     def eval(self):
         dataloader = DataLoader(self.test_dataset)
         embed_dataloader = DataLoader(self.test_embed_dataset)
-        for item, embed_item in  tqdm(zip(dataloader, embed_dataloader)):
+        for item, embed_item in tqdm(zip(dataloader, embed_dataloader)):
             generated_ids = self.generate_custom(item["prompt"], embed_item["block_embedding"])
             generation = self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
             logging.info(f"prompt: {item['prompt']}")
@@ -198,7 +186,7 @@ class CoFi_LDM_Trainer:
 if __name__ == "__main__":
 
     model_id = "meta-llama/Llama-3.1-8B-Instruct"
-    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(50))
+    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(500))
     test_dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="test_sft").select(range(5))
     embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/block_embeddings")
     test_embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/test_block_embeddings")
