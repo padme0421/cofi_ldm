@@ -24,6 +24,15 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
+def get_model_param_norm(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.requires_grad:
+            param_norm = p.data.norm(2)  # L2 norm
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    return total_norm
+
 class CoFi_LDM_Trainer:
     def __init__(self, model_id: str, dataset: Dataset, embed_dataset: Dataset, 
                  test_dataset: Dataset, test_embed_dataset: Dataset):
@@ -36,16 +45,11 @@ class CoFi_LDM_Trainer:
             torch_dtype=torch.bfloat16,
             use_cache=False
         )
-        self.model.gradient_checkpointing_enable()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.tokenizer.pad_token = self.tokenizer.eos_token 
         
-        self.dataset = dataset
-        self.embed_dataset = embed_dataset
-        self.test_dataset = test_dataset
-        self.test_embed_dataset = test_embed_dataset
-
+        #for param in self.model.parameters():
+        #    param.requires_grad = False
+        #self.model.eval()
+        
         lora_config = LoraConfig(
             r=4,
             lora_alpha=4,
@@ -56,6 +60,26 @@ class CoFi_LDM_Trainer:
         )
         self.model = get_peft_model(self.model, lora_config)
         self.model.print_trainable_parameters()
+        self.model.train()
+        
+        self.block_embed_dim = 4096
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(self.block_embed_dim, 1024, dtype=torch.bfloat16), # down
+            torch.nn.GELU(),
+            torch.nn.Linear(1024, self.block_embed_dim, dtype=torch.bfloat16), # up
+            torch.nn.GELU()
+        )
+        self.mlp.to(self.device)
+        self.mlp.train()
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer.pad_token = self.tokenizer.eos_token 
+        
+        self.dataset = dataset
+        self.embed_dataset = embed_dataset
+        self.test_dataset = test_dataset
+        self.test_embed_dataset = test_embed_dataset
+        
 
     @torch.no_grad()
     def generate_custom(self, prompt: str, response_embeddings,
@@ -64,8 +88,10 @@ class CoFi_LDM_Trainer:
         tokenizer = self.tokenizer
         model = self.model
         
-        response_embeddings = torch.tensor(response_embeddings, device=self.device, dtype=torch.bfloat16)
+        response_embeddings = torch.as_tensor(response_embeddings, device=self.device, dtype=torch.bfloat16)
         num_blocks, block_size, _ = response_embeddings.shape
+        
+        compressed_response_embeddings = self.mlp(response_embeddings)
         
         prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
         prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
@@ -82,7 +108,8 @@ class CoFi_LDM_Trainer:
             generated_embeds = model.get_input_embeddings()(next_input_ids)
 
             outputs = model(
-                inputs_embeds=torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, generated_embeds], dim=1),
+                inputs_embeds=torch.cat([prompt_embeds, response_tokens_embeds, 
+                                         compressed_response_embeddings, generated_embeds], dim=1),
                 past_key_values=past_key_values,
                 use_cache=True
             )
@@ -108,7 +135,9 @@ class CoFi_LDM_Trainer:
         tokenizer = self.tokenizer
         model = self.model
 
-        response_embeddings = torch.tensor(inputs["response_embeddings"], dtype=torch.bfloat16, device=self.device)
+        response_embeddings = torch.as_tensor(inputs["response_embeddings"], device=self.device, dtype=torch.bfloat16)
+        compressed_response_embeddings = self.mlp(response_embeddings)
+        
         prompt_ids = tokenizer(f"prompt: {inputs['prompt']}", return_tensors='pt', padding=True).input_ids.to(self.device)
         gold_response_ids = tokenizer(f"response: {inputs['response']}", return_tensors='pt').input_ids.squeeze(0).to(self.device)
 
@@ -132,7 +161,8 @@ class CoFi_LDM_Trainer:
         response_tokens_embeds = embedding_module(response_tokens) # [tokens_len, dim]
         response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
         
-        full_input_embeds = torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
+        full_input_embeds = torch.cat([prompt_embeds, response_tokens_embeds, 
+                                       compressed_response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
 
         context_len = prompt_embeds.size(1) + block_size
         target_len = ar_labels.size(1)
@@ -146,11 +176,12 @@ class CoFi_LDM_Trainer:
         full_labels[:, -target_len:] = ar_labels
 
         output = model(inputs_embeds=full_input_embeds, labels=full_labels)
+        logging.info(output.loss)
+        
         return output.loss
 
     def train(self):
         torch.manual_seed(42)
-        self.model.train()
 
         combined_items = []
         for text_item, embed_item in zip(self.dataset, self.embed_dataset):
@@ -163,18 +194,31 @@ class CoFi_LDM_Trainer:
         combined_dataset = Dataset.from_list(combined_items)
         dataloader = DataLoader(combined_dataset, batch_size=1)
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-5)
-        scaler = torch.cuda.amp.GradScaler()
+        optimizer = torch.optim.AdamW(self.mlp.parameters(), lr=1e-3)
+        #scaler = torch.cuda.amp.GradScaler()
 
         for i, item in tqdm(enumerate(dataloader), total=len(dataloader)):
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                loss = self.training_step(item)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            #with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            loss = self.training_step(item)
+            #scaler.scale(loss).backward()
+        
+            #scaler.step(optimizer)
+            #scaler.update()
+            
+            before = get_model_param_norm(self.mlp)
+            loss.backward()
+            
+            for name, p in self.mlp.named_parameters():
+                logging.info(f"{name}: grad norm = {p.grad.norm() if p.grad is not None else 'None'}")
+            
+            optimizer.step()
+            after = get_model_param_norm(self.mlp)
 
-            logging.info(f"step={i}, loss={loss.item():.4f}")
+            logging.info(f"Param norm before step: {before:.4f}, after step: {after:.4f}, Δ = {after - before:.6f}")
+            
+            logging.info(f"step={i}, loss={loss}")
+            
 
     def eval(self):
         dataloader = DataLoader(self.test_dataset)
