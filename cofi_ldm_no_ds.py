@@ -63,13 +63,17 @@ class CoFi_LDM_Trainer:
 
         tokenizer = self.tokenizer
         model = self.model
-
+        
+        num_blocks, block_size, _ = response_embeddings.shape
+        
+        prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
+        prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
+        
         response_embeddings = torch.tensor(response_embeddings, device=self.device, dtype=torch.bfloat16)
 
-        prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
-        num_blocks, block_size, _ = response_embeddings.shape
-
-        prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
+        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
+        response_tokens_embeds = model.get_input_embeddings()(response_tokens) # [tokens_len, dim]
+        response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
 
         generated = torch.full((num_blocks, 1), tokenizer.bos_token_id, device=self.device)
         past_key_values = None
@@ -79,7 +83,7 @@ class CoFi_LDM_Trainer:
             generated_embeds = model.get_input_embeddings()(next_input_ids)
 
             outputs = model(
-                inputs_embeds=torch.cat([prompt_embeds, response_embeddings, generated_embeds], dim=1),
+                inputs_embeds=torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, generated_embeds], dim=1),
                 past_key_values=past_key_values,
                 use_cache=True
             )
@@ -129,7 +133,7 @@ class CoFi_LDM_Trainer:
         response_tokens_embeds = embedding_module(response_tokens) # [tokens_len, dim]
         response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
         
-        full_input_embeds = torch.cat([prompt_embeds, response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
+        full_input_embeds = torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
 
         context_len = prompt_embeds.size(1) + block_size
         target_len = ar_labels.size(1)
@@ -185,12 +189,13 @@ class CoFi_LDM_Trainer:
 
 if __name__ == "__main__":
 
-    model_id = "meta-llama/Llama-3.1-8B-Instruct"
+    model_id = "meta-llama/Llama-3.1-8B"
     dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(500))
     test_dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="test_sft").select(range(5))
     embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/block_embeddings")
     test_embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/test_block_embeddings")
 
     trainer = CoFi_LDM_Trainer(model_id, dataset, embed_dataset, test_dataset, test_embed_dataset)
-    trainer.train()
-    trainer.eval()
+    for epoch in range(5):
+        trainer.train()
+        trainer.eval()
