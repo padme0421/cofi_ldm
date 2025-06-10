@@ -7,8 +7,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 def block_embeddings(model: PreTrainedModel, ar_model: PreTrainedModel, dataset: Dataset, test_dataset: Dataset,
-                     tokenizer: PreTrainedTokenizer, 
-                     block_size: int):
+                     tokenizer: PreTrainedTokenizer, block_size: int):
     
     embedding_list = []
     for data in tqdm(dataset):
@@ -23,14 +22,14 @@ def block_embeddings(model: PreTrainedModel, ar_model: PreTrainedModel, dataset:
         prompt_ids = torch.tensor(prompt_ids).to(device).unsqueeze(0) # [batch_size, seq_len]
         print(f"prompt ids size: {prompt_ids.size()}")
 
-        out = generate(model, prompt_ids, steps=8, gen_length=64, block_length=block_size, temperature=0., cfg_scale=0., remasking='low_confidence')
+        out = generate(model, prompt_ids, steps=32, gen_length=32, block_length=block_size, temperature=0., cfg_scale=0., remasking='low_confidence')
         response = out[:, prompt_ids.shape[1]:]
         
         print(tokenizer.batch_decode(response, skip_special_tokens=True))
         print(f"response size: {response.size()}")
     
         # for speed, embed at once
-        embedding = ar_model.get_input_embeddings()(response) # [batch_size, seq_len, dim]
+        embedding = model.get_input_embeddings()(response) # [batch_size, seq_len, dim]
         
         batch_blocks = torch.split(embedding, 1, dim=0) # batch_size blocks of size [seq_len, dim]
         for item_blocks in batch_blocks:
@@ -52,14 +51,14 @@ def block_embeddings(model: PreTrainedModel, ar_model: PreTrainedModel, dataset:
         prompt_ids = torch.tensor(prompt_ids).to(device).unsqueeze(0) # [batch_size, seq_len]
         print(f"prompt ids size: {prompt_ids.size()}")
 
-        out = generate(model, prompt_ids, steps=8, gen_length=64, block_length=block_size, temperature=0., cfg_scale=0., remasking='low_confidence')
+        out = generate(model, prompt_ids, steps=32, gen_length=32, block_length=block_size, temperature=0., cfg_scale=0., remasking='low_confidence')
         response = out[:, prompt_ids.shape[1]:]
         
         print(tokenizer.batch_decode(response, skip_special_tokens=True))
         print(f"response size: {response.size()}")
     
         # for speed, embed at once
-        embedding = ar_model.get_input_embeddings()(response) # [batch_size, seq_len, dim]
+        embedding = model.get_input_embeddings()(response) # [batch_size, seq_len, dim]
         
         batch_blocks = torch.split(embedding, 1, dim=0) # batch_size blocks of size [seq_len, dim]
         for item_blocks in batch_blocks:
@@ -74,10 +73,10 @@ def block_embeddings(model: PreTrainedModel, ar_model: PreTrainedModel, dataset:
     test_embedding_dataset = Dataset.from_list(test_embedding_list)
     print(test_embedding_dataset[0])
     
-    path = "/data/gahyunyoo/cofi_ldm/block_embeddings"
+    path = "/data/gahyunyoo/cofi_ldm/block_embeddings_llada"
     embedding_dataset.save_to_disk(path)
     
-    test_path = "/data/gahyunyoo/cofi_ldm/test_block_embeddings"
+    test_path = "/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada"
     test_embedding_dataset.save_to_disk(test_path)
     
     return embedding_dataset, test_embedding_dataset
