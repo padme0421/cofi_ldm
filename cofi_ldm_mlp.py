@@ -75,6 +75,9 @@ class CoFi_LDM_Trainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.tokenizer.pad_token = self.tokenizer.eos_token 
         
+        self.tokenizer.add_special_tokens({'additional_special_tokens': ['<PROMPT>','<GENERATION>','<EMBED>']})
+        self.model.resize_token_embeddings(len(self.tokenizer))
+        
         self.dataset = dataset
         self.embed_dataset = embed_dataset
         self.test_dataset = test_dataset
@@ -93,10 +96,10 @@ class CoFi_LDM_Trainer:
         
         compressed_response_embeddings = self.mlp(response_embeddings)
         
-        prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
+        prompt_ids = tokenizer(f"<PROMPT>{prompt}", return_tensors='pt').input_ids.to(self.device)
         prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
         
-        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
+        response_tokens = tokenizer(f"<EMBED>", return_tensors='pt').input_ids.to(self.device)
         response_tokens_embeds = model.get_input_embeddings()(response_tokens) # [tokens_len, dim]
         response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
 
@@ -138,8 +141,8 @@ class CoFi_LDM_Trainer:
         response_embeddings = torch.as_tensor(inputs["response_embeddings"], device=self.device, dtype=torch.bfloat16)
         compressed_response_embeddings = self.mlp(response_embeddings)
         
-        prompt_ids = tokenizer(f"prompt: {inputs['prompt']}", return_tensors='pt', padding=True).input_ids.to(self.device)
-        gold_response_ids = tokenizer(f"response: {inputs['response']}", return_tensors='pt').input_ids.squeeze(0).to(self.device)
+        prompt_ids = tokenizer(f"<PROMPT>{inputs['prompt']}", return_tensors='pt', padding=True).input_ids.to(self.device)
+        gold_response_ids = tokenizer(f"{inputs['response']}", return_tensors='pt').input_ids.squeeze(0).to(self.device)
 
         num_blocks, block_size, _ = response_embeddings.shape
 
@@ -157,12 +160,19 @@ class CoFi_LDM_Trainer:
 
         ar_embeds = embedding_module(ar_input_ids)
         
-        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
+        ar_tokens_embeds = tokenizer("<GENERATION>", return_tensors='pt').input_ids.to(self.device)
+        ar_tokens_embeds = embedding_module(ar_tokens_embeds) # [tokens_len, dim]
+        ar_tokens_embeds = ar_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
+        
+        response_tokens = tokenizer(f"<EMBED>", return_tensors='pt').input_ids.to(self.device)
         response_tokens_embeds = embedding_module(response_tokens) # [tokens_len, dim]
         response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
         
-        full_input_embeds = torch.cat([prompt_embeds, response_tokens_embeds, 
-                                       compressed_response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
+        full_input_embeds = torch.cat([prompt_embeds, 
+                                       response_tokens_embeds, compressed_response_embeddings, 
+                                       ar_tokens_embeds, ar_embeds
+                                       ], 
+                                        dim=1) # [num_blocks, block_size, dim]
 
         context_len = prompt_embeds.size(1) + block_size
         target_len = ar_labels.size(1)
@@ -223,20 +233,31 @@ class CoFi_LDM_Trainer:
     def eval(self):
         dataloader = DataLoader(self.test_dataset)
         embed_dataloader = DataLoader(self.test_embed_dataset)
+        
+        generation_list = []
         for item, embed_item in tqdm(zip(dataloader, embed_dataloader)):
             generated_ids = self.generate_custom(item["prompt"], embed_item["block_embedding"])
             generation = self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
             logging.info(f"prompt: {item['prompt']}")
             logging.info(f"generation: {generation}")
             logging.info(f"gold response: {item['messages'][1]['content']}")
+            generation_list.append({"prompt": {item['prompt']},
+                                    "generation": {generation},
+                                    "gold_response": {item["messages"][1]['content']}
+                                    })
+            
+        result_dataset = Dataset.from_list(generation_list)
+        result_dataset.save_to_disk("/data/gahyunyoo/cofi_ldm/result_dataset")
+        
+        return result_dataset
 
 if __name__ == "__main__":
 
     model_id = "meta-llama/Llama-3.1-8B"
     dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(500))
     test_dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="test_sft").select(range(5))
-    embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/block_embeddings")
-    test_embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/test_block_embeddings")
+    embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/block_embeddings_llada")
+    test_embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada")
 
     trainer = CoFi_LDM_Trainer(model_id, dataset, embed_dataset, test_dataset, test_embed_dataset)
     for epoch in range(5):
