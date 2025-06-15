@@ -7,4 +7,8 @@
 #SBATCH --mem=16000MB
 #SBATCH --cpus-per-task=1
 
-srun python get_embeddings.py
+srun python get_embeddings.py \
+    --dataset ultrachat \
+    --train_size 500 \
+    --test_size 50 \
+    --block_size 16 \

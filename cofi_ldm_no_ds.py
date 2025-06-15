@@ -8,11 +8,16 @@ from torch.utils.data import DataLoader
 import os
 import huggingface_hub
 from dotenv import load_dotenv
+from torch.nn.utils.rnn import pad_sequence
+import argparse
+import json
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 token = os.environ.get('HF_TOKEN')
 huggingface_hub.login(token)
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -24,27 +29,28 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
-class CoFi_LDM_Trainer:
-    def __init__(self, model_id: str, dataset: Dataset, embed_dataset: Dataset, 
-                 test_dataset: Dataset, test_embed_dataset: Dataset):
+def get_model_param_norm(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.requires_grad:
+            param_norm = p.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    return total_norm
 
+class CoFi_LDM_Trainer:
+    def __init__(self, model_id, dataset, embed_dataset, test_dataset, test_embed_dataset, args):
+        self.config = args
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # set model (with LoRA training)
         self.model = LlamaForCausalLM.from_pretrained(
             model_id,
             device_map="auto",
             torch_dtype=torch.bfloat16,
             use_cache=False
         )
-        self.model.gradient_checkpointing_enable()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.tokenizer.pad_token = self.tokenizer.eos_token 
-        
-        self.dataset = dataset
-        self.embed_dataset = embed_dataset
-        self.test_dataset = test_dataset
-        self.test_embed_dataset = test_embed_dataset
 
         lora_config = LoraConfig(
             r=4,
@@ -55,103 +61,37 @@ class CoFi_LDM_Trainer:
             task_type=TaskType.CAUSAL_LM,
         )
         self.model = get_peft_model(self.model, lora_config)
+        
+        self.model.get_input_embeddings().weight.requires_grad = True
+        self.model.lm_head.weight.requires_grad = True
+        
         self.model.print_trainable_parameters()
-
-    @torch.no_grad()
-    def generate_custom(self, prompt: str, response_embeddings,
-                        temperature=1.0, top_p=0.9) -> torch.Tensor:
-
-        tokenizer = self.tokenizer
-        model = self.model
-        
-        response_embeddings = torch.tensor(response_embeddings, device=self.device, dtype=torch.bfloat16)
-        num_blocks, block_size, _ = response_embeddings.shape
-        
-        prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(self.device)
-        prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(num_blocks, -1, -1)
-        
-        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
-        response_tokens_embeds = model.get_input_embeddings()(response_tokens) # [tokens_len, dim]
-        response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
-
-        generated = torch.full((num_blocks, 1), tokenizer.bos_token_id, device=self.device)
-        past_key_values = None
-
-        for _ in range(block_size):
-            next_input_ids = generated[:, -1:]
-            generated_embeds = model.get_input_embeddings()(next_input_ids)
-
-            outputs = model(
-                inputs_embeds=torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, generated_embeds], dim=1),
-                past_key_values=past_key_values,
-                use_cache=True
-            )
-
-            logits = outputs.logits
-            past_key_values = outputs.past_key_values
-            next_token_logits = logits[:, -1, :]
-
-            if temperature > 0:
-                probs = torch.softmax(next_token_logits / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1)
-
-            generated = torch.cat([generated, next_token], dim=-1)
-
-            if (next_token == tokenizer.eos_token_id).all():
-                break
-
-        return torch.flatten(generated)
-
-    def training_step(self, inputs):
-        tokenizer = self.tokenizer
-        model = self.model
-
-        response_embeddings = torch.tensor(inputs["response_embeddings"], dtype=torch.bfloat16, device=self.device)
-        prompt_ids = tokenizer(f"prompt: {inputs['prompt']}", return_tensors='pt', padding=True).input_ids.to(self.device)
-        gold_response_ids = tokenizer(f"response: {inputs['response']}", return_tensors='pt').input_ids.squeeze(0).to(self.device)
-
-        num_blocks, block_size, _ = response_embeddings.shape
-
-        gold_response_ids_padded = torch.zeros(num_blocks * block_size, dtype=torch.long, device=self.device)
-        gold_response_ids_padded[:min(gold_response_ids.shape[0], gold_response_ids_padded.shape[0])] = \
-            gold_response_ids[:gold_response_ids_padded.shape[0]]
-        gold_response_ids = gold_response_ids_padded
-
-        embedding_module = model.get_input_embeddings()
-        prompt_embeds = embedding_module(prompt_ids).expand(num_blocks, -1, -1)
-
-        gold_blocks = gold_response_ids[:num_blocks * block_size].reshape(num_blocks, block_size)
-        ar_input_ids = gold_blocks[:, :-1]
-        ar_labels = gold_blocks[:, 1:]
-
-        ar_embeds = embedding_module(ar_input_ids)
-        
-        response_tokens = tokenizer(f"response_embeddings: ", return_tensors='pt').input_ids.to(self.device)
-        response_tokens_embeds = embedding_module(response_tokens) # [tokens_len, dim]
-        response_tokens_embeds = response_tokens_embeds.expand(num_blocks, -1, -1) # [num_blocks, tokens_len, dim]
-        
-        full_input_embeds = torch.cat([prompt_embeds, response_tokens_embeds, response_embeddings, ar_embeds], dim=1) # [num_blocks, block_size, dim]
-
-        context_len = prompt_embeds.size(1) + block_size
-        target_len = ar_labels.size(1)
-
-        full_labels = torch.full(
-            (num_blocks, full_input_embeds.size(1)),
-            -100,
-            dtype=torch.long,
-            device=self.device
-        )
-        full_labels[:, -target_len:] = ar_labels
-
-        output = model(inputs_embeds=full_input_embeds, labels=full_labels)
-        return output.loss
-
-    def train(self):
-        torch.manual_seed(42)
         self.model.train()
 
+        # add special token <EMBED>
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if '<EMBED>' not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({'additional_special_tokens': ['<EMBED>']})
+            self.model.resize_token_embeddings(len(self.tokenizer), pad_to_multiple_of=64)
+
+        if self.config.mlp:
+            self.block_embed_dim = 4096
+            self.mlp = torch.nn.Sequential(
+                torch.nn.Linear(self.block_embed_dim, 1024, dtype=torch.bfloat16),
+                torch.nn.GELU(),
+                torch.nn.Linear(1024, self.block_embed_dim, dtype=torch.bfloat16),
+                torch.nn.GELU()
+            )
+            self.mlp.to(self.device)
+            self.mlp.train()
+
+        self.dataset = dataset
+        self.embed_dataset = embed_dataset
+        self.test_dataset = test_dataset
+        self.test_embed_dataset = test_embed_dataset
+        
+        # combined items
         combined_items = []
         for text_item, embed_item in zip(self.dataset, self.embed_dataset):
             combined_items.append({
@@ -160,41 +100,227 @@ class CoFi_LDM_Trainer:
                 "response_embeddings": embed_item["block_embedding"]
             })
 
-        combined_dataset = Dataset.from_list(combined_items)
-        dataloader = DataLoader(combined_dataset, batch_size=1)
+        # combined dataset
+        combined_dataset = Dataset.from_list(combined_items).shuffle()
+        self.combined_dataloader = DataLoader(combined_dataset, shuffle=True, batch_size=1)
+        
+        self.test_dataloader = DataLoader(self.test_dataset)
+        self.test_embed_dataloader = DataLoader(self.test_embed_dataset)
+        
+        # set optimizer
+        if self.config.mlp:
+            self.optimizer = torch.optim.AdamW(
+                list(self.mlp.parameters()) + [p for p in self.model.parameters() if p.requires_grad],
+                lr=self.config.lr
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                [p for p in self.model.parameters() if p.requires_grad],
+                lr=self.config.lr
+            )
+        
+    def training_step(self, inputs):
+        logging.info("training step")
+        
+        # Step 1: Response embeddings
+        response_embeddings = torch.as_tensor(inputs["response_embeddings"], device=self.device, dtype=torch.bfloat16)
+        block_num, block_size, embed_dim = response_embeddings.size()
+        logging.info(f"response_embeddings.size: {response_embeddings.size()}")
+        
+        if self.config.mlp:
+            compressed_response_embeddings = self.mlp(response_embeddings)
+            logging.info(f"compressed_response_embeddings.size: {compressed_response_embeddings.size()}")
+        else: 
+            compressed_response_embeddings = response_embeddings
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-5)
-        scaler = torch.cuda.amp.GradScaler()
+        # Step 2: Prompt embeddings
+        prompt_ids = self.tokenizer(inputs['prompt'], return_tensors='pt').input_ids.to(self.device)
+        prompt_embeds = self.model.get_input_embeddings()(prompt_ids).expand(block_num, -1, -1)  # [block_num, prompt_len, embed_dim]
+        logging.info(f"prompt_embeds.size: {prompt_embeds.size()}")
 
-        for i, item in tqdm(enumerate(dataloader), total=len(dataloader)):
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                loss = self.training_step(item)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        # Step 3: Gold response embeddings and IDs
+        gold_response_ids = self.tokenizer(inputs['response'], return_tensors='pt').input_ids.squeeze(0).to(self.device)  # [block_num * block_size]
+           
+        # Fill truncated positions with PAD instead of -100 before embedding
+        pad_token_id = self.tokenizer.pad_token_id or 0  # fallback to 0 if pad_token_id is None
+        trunc_gold_response_ids = torch.full((block_num * block_size,), pad_token_id, device=self.device)
+        gold_length = min(gold_response_ids.size(0), block_num * block_size)
+        
+        trunc_gold_response_ids[:gold_length] = gold_response_ids[:gold_length] #[block_num * block_size]
+        
+        gold_response_embeds = self.model.get_input_embeddings()(trunc_gold_response_ids)  # [block_num * block_size, embed_dim]
+        split_gold_response_embeds = gold_response_embeds.view(block_num, block_size, embed_dim)
+        logging.info(f"split_gold_response_embeds.size: {split_gold_response_embeds.size()}")
 
-            logging.info(f"step={i}, loss={loss.item():.4f}")
+        # Step 4: <EMBED> token
+        embed_special_token_id = self.tokenizer("<EMBED>", return_tensors='pt').input_ids.to(self.device) # [1,1]
+        embed_special_token_embeds = self.model.get_input_embeddings()(embed_special_token_id).expand(block_num, -1, -1)  # (embed) [1, 1, embed_dim] -> (expand) [block_num, 1, embed_dim]
+
+        # Step 5: input_embeds = [<EMBED>, response, <EMBED>, prompt, gold_response]
+        input_embeds = torch.cat([
+            embed_special_token_embeds,      # [block_num, 1, embed_dim]
+            compressed_response_embeddings,             # [block_num, block_size, embed_dim]
+            embed_special_token_embeds,      # [block_num, 1, embed_dim]
+            prompt_embeds,                   # [block_num, prompt_len, embed_dim]
+            split_gold_response_embeds       # [block_num, block_size, embed_dim]
+        ], dim=1)
+        logging.info(f"input_embeds.size: {input_embeds.size()}")
+
+        # Step 6: Labels
+        split_gold_response_ids = trunc_gold_response_ids.view(block_num, block_size)  # [block_num, block_size]
+        total_len = input_embeds.size(1)
+        labels = torch.full((block_num, total_len), -100, dtype=torch.long, device=self.device)
+        labels[:, -block_size:] = split_gold_response_ids # supervise each block 
+
+        # Step 7: Forward pass
+        output = self.model(inputs_embeds=input_embeds, labels=labels)
+
+        return output.loss
+
+
+    def train(self):
+        
+        for i, batch in tqdm(enumerate(self.combined_dataloader), total=len(self.combined_dataloader)):
+            self.optimizer.zero_grad()
+            
+            try:
+                loss = self.training_step(batch)
+            except Exception as e:
+                # Code to handle other exceptions
+                print(f"An error occurred: {e}")
+                continue
+            
+            before = get_model_param_norm(self.model)
+            
+            loss.backward()
+            self.optimizer.step()
+            
+            after = get_model_param_norm(self.model)
+
+            logging.info(f"step={i}, loss={loss:.4f}, norm_delta={after - before:.6f}")
 
     def eval(self):
-        dataloader = DataLoader(self.test_dataset)
-        embed_dataloader = DataLoader(self.test_embed_dataset)
-        for item, embed_item in tqdm(zip(dataloader, embed_dataloader)):
+        result_cache = []
+        for item, embed_item in tqdm(zip(self.test_dataloader, self.test_embed_dataloader)):
             generated_ids = self.generate_custom(item["prompt"], embed_item["block_embedding"])
-            generation = self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            logging.info(f"prompt: {item['prompt']}")
+            generation = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            logging.info(f"prompt: {item['prompt'][0]}")
             logging.info(f"generation: {generation}")
-            logging.info(f"gold response: {item['messages'][1]['content']}")
+            logging.info(f"gold response: {item['messages'][1]['content'][0]}")
+            result_cache.append({
+                "prompt": item['prompt'][0], 
+                "generation": generation, 
+                "gold response": item['messages'][1]['content'][0]
+            })
+        
+        with open(f"result_train{self.config.train_size}_test{self.config.test_size}_blk{self.config.block_size}_epochs{self.config.epochs}_lr{self.config.lr}_mlp={self.config.mlp}.jsonl", 'w') as f:
+            for item in result_cache:
+                line = json.dumps(item)
+                f.write(f"{line}\n")
+
+    @torch.no_grad()
+    def generate_custom(self, prompt, response_embeddings, max_new_tokens=32, temperature=0.0, top_p=0.9):
+        tokenizer = self.tokenizer
+        model = self.model
+        device = self.device
+
+        # Convert response embeddings
+        response_embeddings = torch.as_tensor(response_embeddings, device=device, dtype=torch.bfloat16)
+        block_num, block_size, embed_dim = response_embeddings.size()
+        
+        if self.config.mlp:
+            compressed_response_embeddings = self.mlp(response_embeddings)
+        else:
+            compressed_response_embeddings = response_embeddings
+
+        # <EMBED> token
+        embed_token_id = tokenizer("<EMBED>", return_tensors='pt').input_ids.to(device)
+        embed_token_embed = model.get_input_embeddings()(embed_token_id).expand(block_num, -1, -1)  # [block_num, 1, embed_dim]
+
+        # Prompt embeddings
+        prompt_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
+        prompt_embeds = model.get_input_embeddings()(prompt_ids).expand(block_num, -1, -1)
+
+        # Precomputed static context: [<EMBED>, response, <EMBED>, prompt]
+        static_context = torch.cat([
+            embed_token_embed,
+            compressed_response_embeddings,
+            embed_token_embed,
+            prompt_embeds
+        ], dim=1)  # shape: [block_num, ctx_len, embed_dim]
+
+        # Prepare initial generated IDs
+        generated_ids = torch.full((block_num, 1), tokenizer.bos_token_id, device=device, dtype=torch.long)
+
+        for _ in range(max_new_tokens):
+            # Embed generated tokens
+            gen_embeds = model.get_input_embeddings()(generated_ids)  # [block_num, gen_len, embed_dim]
+
+            # Build full input: static context + generated so far
+            input_embeds = torch.cat([static_context, gen_embeds], dim=1)  # [block_num, total_len, embed_dim]
+
+            # Forward pass
+            outputs = model(inputs_embeds=input_embeds)
+            next_token_logits = outputs.logits[:, -1, :]  # last position
+
+            # Sample next token
+            if temperature > 0:
+                probs = torch.softmax(next_token_logits / temperature, dim=-1)
+                next_token = sample_top_p(probs, top_p)  # shape: [block_num]
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1)
+
+            print(next_token)
+        
+            # Append to generated
+            generated_ids = torch.cat([generated_ids, next_token.unsqueeze(-1)], dim=1)
+
+            # Stop if all have generated <eos>
+            if (next_token == tokenizer.eos_token_id).all():
+                break
+
+        return torch.flatten(generated_ids)
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_id", type=str)
+    
+    parser.add_argument("--dataset", type=str, choices=["wikitext", "ultrachat"])
+    
+    parser.add_argument("--train_size", type=int)
+    parser.add_argument("--test_size", type=int)
+    
+    parser.add_argument("--block_size", type=int)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--mlp", type=bool)
+    
+    args = parser.parse_args()
+    
+    logging.info(args)
+    
+    torch.manual_seed(42)
+    
+    if args.dataset == "ultrachat":
+        dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(args.train_size))
+        test_dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="test_sft").select(range(args.test_size))
+    elif args.dataset == "wikitext":
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-103-v1", split="train").select(range(args.train_size))
+        test_dataset = load_dataset("Salesforce/wikitext", "wikitext-103-v1", split="test").select(range(args.test_size))
+    
+    default_train_size = 500 
+    default_test_size = 5
+    
+    if (args.train_size == default_train_size) and (args.test_size == default_test_size):
+        embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/block_embeddings_llada")
+        test_embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada")
+    else:
+        embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/block_embeddings_llada_{args.dataset}_{args.train_size}")
+        test_embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada_{args.dataset}_{args.test_size}")
 
-    model_id = "meta-llama/Llama-3.1-8B"
-    dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft").select(range(500))
-    test_dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="test_sft").select(range(5))
-    embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/block_embeddings")
-    test_embed_dataset = load_from_disk("/data/gahyunyoo/cofi_ldm/test_block_embeddings")
-
-    trainer = CoFi_LDM_Trainer(model_id, dataset, embed_dataset, test_dataset, test_embed_dataset)
-    for epoch in range(5):
+    trainer = CoFi_LDM_Trainer(args.model_id, dataset, embed_dataset, test_dataset, test_embed_dataset, args)
+    trainer.eval()
+    for epoch in range(args.epochs):
         trainer.train()
         trainer.eval()
