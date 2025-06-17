@@ -9,11 +9,12 @@
 
 srun python cofi_ldm_no_ds.py \
     --model_id meta-llama/Llama-3.1-8B \
-    --dataset ultrachat \
-    --train_size 500 \
-    --test_size 50 \
+    --dataset truthfulqa \
+    --train_size 0 \
+    --test_size 0 \
     --block_size 16 \
-    --epochs 5 \
+    --gen_length 32 \
+    --epochs 1 \
     --lr 5e-4 \
-    --mlp True
+    #--mlp False
 

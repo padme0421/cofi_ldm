@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from torch.nn.utils.rnn import pad_sequence
 import argparse
 import json
+from get_embeddings import get_prompt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +38,12 @@ def get_model_param_norm(model):
             total_norm += param_norm.item() ** 2
     total_norm = total_norm ** 0.5
     return total_norm
+
+def get_label(data_item, dataset_name):
+    if dataset_name == "ultrachat":
+        return data_item["messages"][1]["content"]
+    elif dataset_name == "truthfulqa":
+        return data_item["best_answer"]
 
 class CoFi_LDM_Trainer:
     def __init__(self, model_id, dataset, embed_dataset, test_dataset, test_embed_dataset, args):
@@ -95,8 +102,8 @@ class CoFi_LDM_Trainer:
         combined_items = []
         for text_item, embed_item in zip(self.dataset, self.embed_dataset):
             combined_items.append({
-                "prompt": text_item["prompt"],
-                "response": text_item["messages"][1]["content"],
+                "prompt": get_prompt(text_item, self.config.dataset), 
+                "response": get_label(text_item, self.config.dataset),
                 "response_embeddings": embed_item["block_embedding"]
             })
 
@@ -202,18 +209,21 @@ class CoFi_LDM_Trainer:
     def eval(self):
         result_cache = []
         for item, embed_item in tqdm(zip(self.test_dataloader, self.test_embed_dataloader)):
-            generated_ids = self.generate_custom(item["prompt"], embed_item["block_embedding"])
+            prompt = get_prompt(item, self.config.dataset)
+            label = get_label(item, self.config.dataset)
+            
+            generated_ids = self.generate_custom(prompt, embed_item["block_embedding"])
             generation = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            logging.info(f"prompt: {item['prompt'][0]}")
+            logging.info(f"prompt: {prompt[0]}")
             logging.info(f"generation: {generation}")
-            logging.info(f"gold response: {item['messages'][1]['content'][0]}")
+            logging.info(f"gold response: {label[0]}")
             result_cache.append({
-                "prompt": item['prompt'][0], 
+                "prompt": prompt[0], 
                 "generation": generation, 
-                "gold response": item['messages'][1]['content'][0]
+                "gold response": label[0]
             })
         
-        with open(f"result_train{self.config.train_size}_test{self.config.test_size}_blk{self.config.block_size}_epochs{self.config.epochs}_lr{self.config.lr}_mlp={self.config.mlp}.jsonl", 'w') as f:
+        with open(f"fixed_result_{self.config.dataset}_train{self.config.train_size}_test{self.config.test_size}_blk{self.config.block_size}_gen{self.config.gen_length}_epochs{self.config.epochs}_lr{self.config.lr}_mlp={self.config.mlp}.jsonl", 'w') as f:
             for item in result_cache:
                 line = json.dumps(item)
                 f.write(f"{line}\n")
@@ -251,14 +261,14 @@ class CoFi_LDM_Trainer:
 
         # Prepare initial generated IDs
         generated_ids = torch.full((block_num, 1), tokenizer.bos_token_id, device=device, dtype=torch.long)
-
-        for _ in range(max_new_tokens):
+        
+        for i in range(max_new_tokens):
             # Embed generated tokens
             gen_embeds = model.get_input_embeddings()(generated_ids)  # [block_num, gen_len, embed_dim]
 
             # Build full input: static context + generated so far
             input_embeds = torch.cat([static_context, gen_embeds], dim=1)  # [block_num, total_len, embed_dim]
-
+            
             # Forward pass
             outputs = model(inputs_embeds=input_embeds)
             next_token_logits = outputs.logits[:, -1, :]  # last position
@@ -269,12 +279,10 @@ class CoFi_LDM_Trainer:
                 next_token = sample_top_p(probs, top_p)  # shape: [block_num]
             else:
                 next_token = torch.argmax(next_token_logits, dim=-1)
-
-            print(next_token)
         
             # Append to generated
             generated_ids = torch.cat([generated_ids, next_token.unsqueeze(-1)], dim=1)
-
+            
             # Stop if all have generated <eos>
             if (next_token == tokenizer.eos_token_id).all():
                 break
@@ -286,7 +294,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str)
     
-    parser.add_argument("--dataset", type=str, choices=["wikitext", "ultrachat"])
+    parser.add_argument("--dataset", type=str, choices=["truthfulqa", "wikitext", "ultrachat"])
     
     parser.add_argument("--train_size", type=int)
     parser.add_argument("--test_size", type=int)
@@ -294,7 +302,8 @@ if __name__ == "__main__":
     parser.add_argument("--block_size", type=int)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--lr", type=float)
-    parser.add_argument("--mlp", type=bool)
+    parser.add_argument("--gen_length", type=int)
+    parser.add_argument("--mlp", action="store_true")
     
     args = parser.parse_args()
     
@@ -308,16 +317,25 @@ if __name__ == "__main__":
     elif args.dataset == "wikitext":
         dataset = load_dataset("Salesforce/wikitext", "wikitext-103-v1", split="train").select(range(args.train_size))
         test_dataset = load_dataset("Salesforce/wikitext", "wikitext-103-v1", split="test").select(range(args.test_size))
+    elif args.dataset == "truthfulqa":
+        # use all samples
+        subset = "generation"
+        split = "validation"
+        dataset = load_dataset("truthfulqa/truthful_qa", subset, split=split)
+        dataset_dict = dataset.train_test_split(test_size=0.2, seed=42)
+        dataset, test_dataset = dataset_dict["train"], dataset_dict["test"]
     
     default_train_size = 500 
     default_test_size = 5
+    
+    signature = f"{args.dataset}_train{args.train_size}_test{args.test_size}_blk{args.block_size}_gen{args.gen_length}"
     
     if (args.train_size == default_train_size) and (args.test_size == default_test_size):
         embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/block_embeddings_llada")
         test_embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada")
     else:
-        embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/block_embeddings_llada_{args.dataset}_{args.train_size}")
-        test_embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada_{args.dataset}_{args.test_size}")
+        embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/block_embeddings_llada_{signature}")
+        test_embed_dataset = load_from_disk(f"/data/gahyunyoo/cofi_ldm/test_block_embeddings_llada_{signature}")
 
     trainer = CoFi_LDM_Trainer(args.model_id, dataset, embed_dataset, test_dataset, test_embed_dataset, args)
     trainer.eval()
