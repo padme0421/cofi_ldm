@@ -1,0 +1,4 @@
+make sure mlp is updated
+better generation for LLADA
+
+bos token부터 시작
